@@ -1,0 +1,578 @@
+---
+title: "Mapping in R"
+output:
+  learnr::tutorial:
+    progressive: true
+    allow_skip: true
+runtime: shiny_prerendered
+description: >
+  Learn to use RStudio to pull data from TidyCensus, 
+  compare map design, and visualize accompanying data.
+---
+
+```{r setup, include=FALSE}
+library(learnr)
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(sf)
+library(tidycensus)
+library(rempsyc)
+library(biscale)
+library(cowplot)
+```
+
+
+## Welcome
+
+In this tutorial, you will learn how the basic skills of mapping spatial 
+relationships in Rstudio including:
+
+* The basics of RStudio for this application, including tidy data and RMarkdowns. 
+* How to pull data from an Application Programming Interface (API)
+* How to combine datasets based on their spatial relationships
+* How to conduct exploratory analyses
+* How to visualize spatial data 
+
+### Setup
+
+To practice these skills, we will answer the question, Are there any sociodemographic 
+patterns in public Electric Vehicle (EV) infrastructure  for Davidson County, TN? 
+We will access EV charging station data from the [National Renewable Energy Laboratory (NREL)](https://developer.nrel.gov/docs/transportation/alt-fuel-stations-v1/all/), 
+and sociodemographic data from the [American Community Survey](https://www.census.gov/programs-surveys/acs/data.html). 
+
+I've preloaded the packages for this tutorial with the following: 
+
+```{r load packages, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse) # loads dplyr, ggplot2, and others
+library(tidycensus) # provides access to ACS data
+library(httr) # for API requests
+library(jsonlite) # for API requests
+library(sf) # for mapping shapefiles
+library(cowplot) # for combining plots
+library(rempsyc) # for statistical tests
+library(biscale) # for bivariate mapping
+```
+
+
+## Download data from an API
+
+### EV Charging Data
+
+**_NOTE:_**  Before we get started, you'll have to [register for an API key](https://developer.nrel.gov/signup/), which will allow you to pull your
+very own data requests. API keys should not be shared. 
+
+Once you've got your key, go ahead and paste it in the next chunk.
+```{r load API key, echo=TRUE}
+my_api_key <- "" # paste key between quotations
+```
+
+```{r load my API, include=FALSE}
+
+my_api_key <- "hRugwQrdFhJm7IYUiOg37ghpYgjXBoOecbh4gOxn"
+```
+
+APIs are fabulous alternatives to manually downloading data, allowing researchers
+to ensure their data analysis is replicable, from download to publication. In our
+case, we will be submitting a "GET" request, which signals the API that you'd
+like some of its data. Our GET request will be made up of a few parts:
+
+* Supplying a URL for the API
+* Limiting our request to certain query parameters
+* Checking that our request was successful
+* Converting our request from JSON to text
+
+First, let's supply our URL and query parameters. When searching for
+publicly-available datasets, APIs are often made available with accompanying
+documentation. For our EV data, NREL kindly supplies its [documentation](https://developer.nrel.gov/docs/transportation/alt-fuel-stations-v1/all/)
+on its site.
+
+```{r creating API request, echo=TRUE, message=FALSE, warning=FALSE}
+# set the primary URL for the API
+nrel_url <- "https://developer.nrel.gov/api/alt-fuel-stations/v1.json?"
+
+# set the target state for the data retrieval, in this case, TN
+state <- "TN"
+
+# paste together the full string to retrieve the data
+nrel_api_url <- paste0(nrel_url, "api_key=", my_api_key, "&state=", state, "&limit=all")
+
+# use the full api url to get the data
+EV_data <- GET(nrel_api_url)
+```
+
+Now, let's make sure that request was successful. 
+```{r GET request status, echo=TRUE, warning=FALSE}
+EV_data
+```
+
+This summary tells us the URL we sent the request to, the timestamp, the type of 
+content, and the status. Status is important, because it let's us know if there
+were any problems in our query. 200 means your request was successful, but in the
+event of a different code, here's a [list](https://www.restapitutorial.com/httpstatuscodes.html) 
+of other codes you may encounter. 
+
+Let's convert our JSON request to something more legible in R. In this chunk, we're 
+using the function `fromJSON()` to convert the raw data to character data. This dataframe 
+is actually several lists in a dataframe, let's extract only the data by subsetting 
+the dataframe we're interested in, entitled `fuel_stations`.
+
+```{r converting from JSON, echo=TRUE, message=FALSE, warning=FALSE}
+EV_data <- jsonlite::fromJSON(rawToChar(EV_data$content))
+
+EV_data <- EV_data[["fuel_stations"]]
+```
+
+Great, this is more aligned with something we might be more accustomed to. Our 
+public EV charging station data for the state of TN has `r format(nrow(EV_data), big.mark = ",")` 
+entries, which we should probably trim down to only represent Davidson County, TN. 
+
+First, we give our new dataframe a name, I call it `nash_EV`, so that I
+remember it's a subset of our TN dataset. We then call our dataframe of interest,
+`EV_data`, and we pipe it into our next command (pipes are used to connect and 
+simplify your commands; they basically tell R to do this "and then" that). 
+Next, we'll filter our data for `city` (Nashville, TN), `fuel_type` (Electric),
+and `access_code` (public). 
+
+We'll also go ahead and simplify our dataframe by selecting for the variables we're 
+most interested in, `status_code`, `access_code`, `fuel_type_code`, `owner_type_code`,`latitude`,
+and `longitude`. 
+
+```{r filtering for Nashville, echo=TRUE, message=FALSE, warning=FALSE}
+nash_EV <- EV_data %>%
+            filter(city == "Nashville" & 
+                   fuel_type_code == "ELEC" &
+                   access_code == "public") %>% 
+            dplyr::select(status_code, access_code, fuel_type_code, owner_type_code,
+                   latitude, longitude)
+
+#take a look
+glimpse(nash_EV)  
+```
+
+Shall we map it? Because we've got latitude and longitude, it's relatively easy
+to represent this data spatially, as points. 
+
+**_NOTE:_**  Datums, projections and coordinate systems matter! Datums model the 
+Earth, so that they can be used for coordinate systems. coordinate systems provide 
+numerical information that allows you to position your data on Earth. Meanwhile, 
+Projections are how you, the mapmaker, translate the curved surface of the earth 
+to a flat surface.
+
+For this project, I'll use the NAD83 datum, because it's what most federal agencies 
+use. While I could opt to use a State Plane Coordinate System, I'm not doing any
+overly complex distance calculations, so WGS84 should be just fine. I encourage 
+you to read more about projections and coordinate systems 
+[here](https://mgimond.github.io/Spatial/chp09_0.html)
+
+
+We'll use the package, `sf` to convert our `nash_EV` dataframe into an sf object. 
+The `st_as_sf()` function is our powerhouse here, and we supply it with the `nash_EV`
+dataframe, the coordinate columns, the coordinate reference system (in this case
+it is NAD83), please see this [resource](https://www.nceas.ucsb.edu/sites/default/files/2020-04/OverviewCoordinateReferenceSystems.pdf)
+for more information. 
+
+```{r making EV data spatial, echo=TRUE, fig.height=4, fig.width=7.5, message=FALSE, warning=FALSE}
+
+# create shapefile
+ev_sf <- nash_EV %>%
+  st_as_sf(
+    coords = c(x = "longitude", y = "latitude"),
+    crs = "EPSG:4269" #define CRS for NAD83
+    )
+
+# check that crs worked
+st_crs(ev_sf)
+
+# plot!
+ggplot(ev_sf) +
+    geom_sf() 
+```
+
+Phew, we did it! Unfortunately though, we need a bit more information to call 
+this an effective map. Let's add in some sociodemographics, next.
+
+### ACS Data
+
+A [2022 paper](https://doi.org/10.1016/j.tej.2022.107096 ) published by Khan et. al.,
+assessed EV charging stations in New York City, suggesting that EV charger locations 
+may be correlated to sociodemographic variables. Interestingly, median household 
+income, percentage of white individuals, and presence of a highway were positively 
+correlated with the presence of an EV charging station. Meanwhile, the percentage 
+of Black individuals in a zip code were negatively correlated.
+
+Let's see if these patterns hold true for the city of Nashville. 
+
+We'll need race/ethnicity variables and household income information from the 
+census. Let's use the `TidyCensus` package to download our data directly from 
+the Bureau's API.
+
+**_NOTE:_**  You'll have to [register for a Census Bureau API key](https://api.census.gov/data/key_signup.html) first, which will allow you 
+to pull your very own data requests. API keys should not be shared. You can use the 
+`census_api_key()` function to store your key for the session. 
+
+For this session, we'll use ACS data from the US Census Bureau, using 5-year estimates. 
+We can load all of the variables and their unique codes using the function 
+`load_variables()`. We'll specify `acs5` as the dataset, and cache it, so things 
+move a bit faster. 
+
+Next, we'll create a query for our data using the function, `get_acs()`. We'll provide it 
+the following parameters: 
+
+* `geography` specifies the level of geography you'd like. We'll use tract for this
+session, but there are several [other levels](https://www.census.gov/newsroom/blogs/random-samplings/2014/07/understanding-geographic-relationships-counties-places-tracts-and-more.html) you can query. 
+* `survey` specifies the type of ACS data you'd like. We'll use ACS 5-year estimates
+* `variables` can be defined using the `acs_vars` dataframe we created. We'll create
+a list for total population, median income, as well as race/ethnicity values.
+* `state` will specify the US state of interest, in this case TN. 
+* `county` will specify a county of interest, in this case Davidson. 
+* `year` will specify the end date for the ACS estimate, in this case we'll use 
+the 2016 to 2020 dataset.
+* `geometry` will specify whether we want a shapefile or not, which in this case we do.
+* `output` will specify the shape of the data, which in this case we'd like wide, 
+rather than long. 
+
+```{r TidyCensus Request, echo=TRUE, results = FALSE, message=FALSE, warning=FALSE}
+
+# Run this line first: census_api_key("YOUR API KEY GOES HERE") 
+
+acs_vars <- load_variables(2020, "acs5", cache = TRUE) # Get ACS variables
+
+davidson_acs <- get_acs(geography = "tract", 
+                survey = "acs5",        
+                variables = c(total_pop = "B03002_001",
+                              medincome = "B19013_001",
+                              white_non_hisp = "B03002_003", 
+                              black_non_hisp = "B03002_004", 
+                              asian_non_hisp = "B03002_006", 
+                              hisp = "B03002_012"), 
+                state = "TN",
+                county = "Davidson",
+                year = 2020, 
+                geometry = TRUE,
+                output = "wide")
+```
+
+This created a multipolygon dataset, with `r format(nrow(davidson_acs))` rows, 
+representing each census tract in the county and the Estimate and Margin of 
+Error for each variable of interest. 
+```{r}
+glimpse(davidson_acs)
+```
+
+
+**_NOTE:_**  Because the ACS is based on estimates rather than official counts 
+(like the decennial census), understanding the Margin of Error associated with 
+each estimate is incredibly important; I'd suggest reading more [here](https://walker-data.com/tidycensus/articles/margins-of-error.html!)
+
+Let's go ahead and standardize these counts, so we can compare percentages. We'll
+use the `mutate()` function to create percentage variables for race/ethnicity, and 
+we'll also select only the variables we need. 
+
+```{r Tidycensus Formatting, echo=TRUE, message=FALSE, warning=FALSE}
+davidson_tract <- davidson_acs %>% 
+                  mutate(perc_nh_white = (white_non_hispE/total_popE)*100, 
+                         perc_nh_black = (black_non_hispE/total_popE)*100,
+                         perc_nh_asian = (asian_non_hispE/total_popE)*100, 
+                         perc_hisp = (hispE/total_popE)*100,
+                         medhhinc = medincomeE) %>%
+      dplyr::select(GEOID, total_popE, perc_nh_white, perc_nh_asian, 
+                    perc_nh_black, perc_hisp, medhhinc)
+
+glimpse(davidson_tract)
+```
+
+Quick check to ensure the CRS is the same as our nashville EV charging infrastructure
+```{r ACS CRS check, echo=TRUE, message=FALSE, warning=FALSE}
+st_crs(davidson_tract)
+```
+
+Finally, let's conduct a few quick checks, just to ensure the data looks alright. 
+
+First, let's create a quick plot of median household income. We'll use the `ggplot2` 
+package for this tutorial, along with the `sf` package, but know there are loads of 
+other mapping packages out there. 
+
+To map our tract shapefile, we'll define the spatial dataframe being used in 
+the `ggplot()` function, then add a `geom_sf()` call, with `medhhinc` in the 
+`aes()` function. We can also clean up some of the labels. 
+
+```{r Map MHI, echo=TRUE, message=FALSE, warning=FALSE, fig.height=4, fig.width=7.5}
+ggplot(data = davidson_tract) +
+  geom_sf(aes(fill = medhhinc)) + 
+  labs(title = "Median Household Income in Nashville, TN",
+       fill = "Median Household \n Income (USD)",
+       caption = "Source: 2016-2020 ACS, US Census Bureau") 
+```
+
+Those greyed tracts are interesting, we can take a look at the NAs in the data 
+and compare them with this map to ensure that they're non-residential. We can use
+a [tract map](http://maps.nashville.gov/webimages/MapGallery/PDFMaps/2010%20Census%20Tracts.pdf) 
+of Nashville to double check. It looks like these tracts are the BNA airport, and 
+a smaller airport/industrial area. 
+```{r check for NA census tracts, echo=TRUE, message=FALSE, warning=FALSE}
+davidson_tract %>% 
+  filter(is.na(medhhinc)) %>% 
+  dplyr::select(GEOID)
+```
+
+
+## Combining Spatial Data
+
+To begin some exploratory analyses on the relationship between EV charging 
+stations and sociodemographics, we need to summarize the EV locations to the 
+tract level. 
+
+We'll use the function `st_join()`, defining the points (`ev_sf`) and the 
+polygons (`davidson_tract`), using the join type, `st_within()`. 
+
+Following, we'll summarize the tract_count by using the `count()` function, 
+specifying that we'd like a count for each unique `GEOID`. We'll also rename the 
+default variable name (`n`) to `ev_count`. 
+
+```{r Summarize EV locations, echo=TRUE, message=FALSE, warning=FALSE}
+# Summarize EV locations
+ev_in_tract <- st_join(ev_sf, davidson_tract, join = st_within)
+
+# count EV stations per census tract
+ev_tract_count <- count(as_tibble(ev_in_tract), GEOID) %>%
+                  rename(ev_count = n) 
+
+glimpse(ev_tract_count)
+```
+
+And we'll join! Use a `join()` function define the left dataframe, `davidson_tract` 
+that we'll be joining to the `ev_tract_count`. Then, we use `mutate()` to fill the
+replace the NAs in our `ev_count` column with zeroes. We also add a new column, 
+`presence_stations`, which is a binary factor. Lastly, we remove any rows that 
+have an NA for `medhhinc` (i.e., the airport/commercial spaces we saw above). 
+
+```{r Join with tract, echo=TRUE, message=FALSE, warning=FALSE}
+# join ev count with tract df, calc EV station density
+tract_ev_sf <- left_join(davidson_tract, ev_tract_count) %>%
+               mutate(ev_count = ifelse(is.na(ev_count), 0, ev_count),
+                      presence_stations = factor(ifelse(ev_count > 0, 1, 0))) %>% 
+               na.omit(medhhinc)
+
+glimpse(tract_ev_sf)
+```
+
+Let's also do a quick map! Using the same approach as above, we'll layer two 
+shapefiles (one point, one polygon). 
+```{r Mapping the two, echo=TRUE, message=FALSE, warning=FALSE, fig.height=4, fig.width=7.5}
+ggplot() +
+  geom_sf(data = davidson_tract) +
+  geom_sf(data = ev_sf, fill = "black") +
+  labs(title = "EV Charge Stations Located in Davidson County Tracts",
+       caption = "Source: NREL + US Census") +  
+  theme_bw()
+```
+
+## Exploratory Analysis
+### Boxplots
+
+Now that we've got the data summarized to the tract level, let's start by creating some 
+boxplots.
+
+To make several and compare at once, I'll save them as individual objects, and use 
+the package `cowplot` to bind them all together. 
+
+**_NOTE:_** Functions are the ideal approach to simplifying repetitive processes, 
+but functions can be a bit complex. Read more [here](https://r4ds.hadley.nz/functions) if you're interested!
+
+To make boxplots, we define the dataframe (`tract_ev_sf`) and pipe it into a `ggplot()`
+object. We'll assign the aesthetics for the factor variable, `presence_stations`, 
+and the continuous variable, `medhhinc`. Then, add a `geom_boxplot()` object, and 
+specify a color of your choice. 
+
+Repeat for other variables of interest, and plot the grid.
+
+```{r boxplot facet, echo=TRUE, message=FALSE, warning=FALSE, fig.height=4, fig.width=7.5}
+a <- tract_ev_sf %>% 
+      ggplot(aes(presence_stations, medhhinc)) + 
+      geom_boxplot(fill = "#75A6A2")
+
+b <- tract_ev_sf %>% 
+      ggplot(aes(presence_stations, total_popE)) + 
+      geom_boxplot(fill = "#75A6A2")
+
+c <- tract_ev_sf %>% 
+     ggplot(aes(presence_stations, perc_nh_white)) + 
+    geom_boxplot(fill = "#75A6A2")
+
+d <- tract_ev_sf %>% 
+     ggplot(aes(presence_stations, perc_nh_asian)) + 
+    geom_boxplot(fill = "#75A6A2")
+
+e <- tract_ev_sf %>% 
+      ggplot(aes(presence_stations, perc_nh_black)) + 
+      geom_boxplot(fill = "#75A6A2")
+
+f <- tract_ev_sf %>% 
+      ggplot(aes(presence_stations, perc_hisp)) + 
+      geom_boxplot(fill = "#75A6A2")
+
+cowplot::plot_grid(a, b, c, d, e, f, ncol = 3)
+```
+Looks like there could be some interesting patterns between race/ethnicity and 
+EV station locations. 
+
+### Correlative patterns
+
+Khan et al., used unpaired t-tests to assess the relationships between the 
+presence of EV charging stations and sociodemographics, so let's start there. 
+First, we'll use the `rempsyc` package for it's `nice_t_test()` function. Start 
+by calling our dataframe, `tract_ev_sf`, then select the variables of interest, 
+in this case `presence_stations`, and all of the columns from `total_popE` to 
+`medhhinc`. Then, we use the `st_drop_geometry()`function to temporarily drop 
+the spatial component of our dataframe. 
+
+Lastly, we use the `nice_t_test()` function to define the columns of interest, 
+and the `group`, which is `presence_stations`.
+
+We can use the `nice_table()` function to create a prettier table. 
+
+```{r Correlation Table, echo=TRUE, message=TRUE, warning=FALSE}
+t.test.results <- tract_ev_sf %>% 
+                  dplyr::select(presence_stations, total_popE:medhhinc) %>% 
+                  st_drop_geometry() %>% 
+                  nice_t_test(response = names(tract_ev_sf)[2:7],
+                  group = "presence_stations")
+
+nice_table(t.test.results)
+```
+
+It looks like there is some positive correlation between the presence of EV 
+charging stations in more populated census tracts, as well as tracts with more 
+Black individuals. Interestingly, there's a negative correlation with tracts 
+containing more non-Hispanic white individuals. Let's see if we can map the two 
+together.
+
+## Maps
+Finally, more maps! Although there's plenty of ways to map this information,
+we'll focus on bivariate mapping, which is similar to a chloropleth, 
+but allows us to visualize two variables (i.e., EV charging station counts and 
+percentage of non-Hispanic white individuals) in the same map. 
+
+To do so, we'll use the `biscale` package, and create a new dataframe `bi_white`, 
+so that bivariate classes are assigned to the data using the `bi_class` function. 
+
+We use `perc_nn_white` as our `x`, `ev_count` as our `y`, and fisher breaks for 
+our `style`, and 3 colors for the `dim` option. 
+
+**_NOTE:_**  Legend breaks vary by the story we're trying to tell. In this case, 
+I chose Fisher's because it optimizes the classifications for a specific number 
+of classes, which in this case is 3. There's a handy Book chapter that details 
+the differences in legend classifications [here](https://geographicdata.science/book/notebooks/05_choropleth.html#). 
+
+```{r Bivariate df, echo=TRUE, message=FALSE, warning=FALSE}
+bi_white <- bi_class(tract_ev_sf, x = perc_nh_white, y = ev_count, 
+                     style = "fisher", dim = 3)
+```
+
+The `biscale` package uses the `ggplot2` approach, which we're already familiar
+with! We create a `ggplot()` object, add a `geom_sf` object, specifying our new
+`bi_white` dataframe, our fill column, `bi_class`, and some other aesthetic 
+details, such as line color and width.  
+
+I chose the "Bluegill" palette for this approach, but there are several [others](https://cran.r-project.org/web/packages/biscale/vignettes/bivariate_palettes.html)
+available. 
+
+```{r Bivariate ggplot, echo=TRUE, message=FALSE, warning=FALSE}
+
+white_map <- ggplot() +
+             geom_sf(data = bi_white, aes(fill = bi_class), 
+                     color = "white", size = 0.1, show.legend = FALSE) +
+            bi_scale_fill(pal = "Bluegill", dim = 3) +
+            bi_theme()
+```
+
+I also want to create a nice legend to accompany this, so I'll use the `bi_legend`
+function to specify my palette, the number of colors, and the labels I'd like. 
+
+```{r Bivariate legend, echo=TRUE, message=FALSE, warning=FALSE}
+white_legend <- bi_legend(pal = "Bluegill",
+                          dim = 3,
+                          xlab = "  % White",
+                          ylab = "Charging Stations",
+                          size = 8)
+```
+
+The last step is adding the map and legend together, using the `ggdraw()` function. 
+
+```{r add elements, echo=TRUE, message=FALSE, warning=FALSE, fig.height=4, fig.width=7.5}
+whitePlot <- ggdraw() +
+  draw_plot(white_map, 0, 0, 1, 1) +
+  draw_plot(white_legend, 0.05, .6, 0.2, 0.2)
+
+whitePlot
+```
+
+If we wanted to repeat this process, we could make bivariate maps for percentage 
+of Black individuals and total population. Then we can combine all of the
+figures into one final plot. 
+
+```{r repeat for other vars, echo=TRUE, results = FALSE, message=FALSE, warning=FALSE}
+## Black
+bi_black <- bi_class(tract_ev_sf, x = perc_nh_black, y = ev_count, style = "fisher", dim = 3)
+
+black_map <- ggplot() +
+             geom_sf(data = bi_black, aes(fill = bi_class), 
+                     color = "white", size = 0.1, show.legend = FALSE) +
+            bi_scale_fill(pal = "Bluegill", dim = 3) +
+            bi_theme()
+  
+black_legend <- bi_legend(pal = "Bluegill",
+                          dim = 3,
+                          xlab = "  % Black",
+                          ylab = "Charging Stations",
+                          size = 8)
+
+blackPlot <- ggdraw() +
+  draw_plot(black_map, 0, 0, 1, 1) +
+  draw_plot(black_legend, 0.05, .6, 0.2, 0.2)
+
+## Total Population
+bi_pop <- bi_class(tract_ev_sf, x = total_popE, y = ev_count, style = "fisher", dim = 3)
+
+pop_map <- ggplot() +
+             geom_sf(data = bi_pop, aes(fill = bi_class), 
+                     color = "white", size = 0.1, show.legend = FALSE) +
+            bi_scale_fill(pal = "Bluegill", dim = 3) +
+            bi_theme()
+  
+pop_legend <- bi_legend(pal = "Bluegill",
+                          dim = 3,
+                          xlab = "Total Pop",
+                          ylab = "Charging Stations",
+                          size = 8)
+
+popPlot <- ggdraw() +
+  draw_plot(pop_map, 0, 0, 1, 1) +
+  draw_plot(pop_legend, 0.05, .6, 0.2, 0.2)
+```
+
+Plot together using cowplot
+```{r Plot Together, echo=TRUE, results = FALSE, message=FALSE, warning=FALSE}
+final_map <- cowplot::plot_grid(whitePlot, blackPlot, popPlot, nrow = 1, 
+                   labels = c("% White Individuals", "% Black Individuals", 
+                              "Total Population"))
+```
+
+Congratulations!! You've completed this Mapping in R Tutorial, and learned more 
+about Nashville's transportation infrastructure along the way! 🌟🤩
+
+## Additional Resources
+If you're interested learning more, here are some extra resources that are all freely
+available to you online:
+
+* [R for Data Science 2](https://r4ds.hadley.nz/)
+* [TidyCensus Tutorials](https://walker-data.com/tidycensus/index.html)
+* [Hands on Programming with R](https://rstudio-education.github.io/hopr/)
+* [Geocomputation with R](https://r.geocompx.org/)
+* [Simple Features for R](https://r-spatial.github.io/sf/index.html)
+* Fun Blog: [Julia Silge's Website](https://juliasilge.com/blog/)
+
+### Contact me!
+As always, please feel free to email me with any questions at 
+[mariah.d.caballero@vanderbilt.edu](mailto:mariah.d.caballero@vanderbilt.edu)
